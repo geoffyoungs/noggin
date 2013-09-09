@@ -8,6 +8,9 @@
 --- Noggin.ippRequest(Integer operation, request_attributes)
 
 
+--- Noggin.printFile(String destinationName, String fileName, String title, Hash options)
+
+
 == Noggin::WHICHJOBS_ALL
 == Noggin::WHICHJOBS_ACTIVE
 == Noggin::WHICHJOBS_COMPLETED
@@ -19,3 +22,4 @@
 === Noggin::Job::ALL
 == module Noggin::IPP
 === Noggin::IPP::GET_JOBS
+== class Noggin::IppRequest

@@ -8,7 +8,7 @@
 
 %{
 
-VALUE inline as_string(const char *string) { return string ? rb_str_new2(string) : Qnil;  }
+inline VALUE as_string(const char *string) { return string ? rb_str_new2(string) : Qnil;  }
 
 #define TO_STRING(v) ((v) ? rb_str_new2((v)) : Qnil)
 
@@ -20,6 +20,7 @@ static VALUE sym_pending = Qnil;
 static VALUE sym_processing = Qnil;
 static VALUE sym_stopped = Qnil;
 
+#define SUBSCRIPTION_DURATION 3600
 #define STATIC_STR(name) static VALUE str_##name = Qnil;
 #define STATIC_STR_INIT(name) KEEP_ADD(str_##name = rb_str_new2(#name)); rb_obj_freeze(str_##name);
 STATIC_STR(completed_time);
@@ -38,6 +39,72 @@ STATIC_STR(name);
 STATIC_STR(instance);
 STATIC_STR(is_default);
 STATIC_STR(options);
+
+struct svp_it {
+  int num_options;
+  cups_option_t *options;
+};
+
+int hash_to_cups_options_it(VALUE key, VALUE val, VALUE data) {
+  struct svp_it *svp  = (struct svp_it *)data;
+  svp->num_options = cupsAddOption(StringValuePtr(key), StringValuePtr(val), svp->num_options, &(svp->options));
+  return ST_CONTINUE;
+}
+
+static VALUE rb_ipp_value_entry(ipp_attribute_t* attr, int count) {
+  char *lang = NULL;
+  char block[4096] = "";
+ 
+  /*char block[4096] = "";
+  ippAttributeString(attr, block, 4096);
+  printf("%s: (0x%x) %s\n", ippGetName(attr), ippGetValueTag(attr), block);*/
+
+  switch (ippGetValueTag(attr)) {
+  case IPP_TAG_INTEGER:
+    return INT2NUM(ippGetInteger(attr, count));
+  case IPP_TAG_RESERVED_STRING:
+  case IPP_TAG_STRING:
+  case IPP_TAG_SUBSCRIPTION:
+  case IPP_TAG_TEXT:
+  case IPP_TAG_NAME:
+  case IPP_TAG_KEYWORD:
+  case IPP_TAG_URI:
+  case IPP_TAG_TEXTLANG:
+  case IPP_TAG_NAMELANG:
+  case IPP_TAG_LANGUAGE:
+  case IPP_TAG_CHARSET:
+  case IPP_TAG_MIMETYPE:
+  case IPP_TAG_MEMBERNAME:
+  case IPP_TAG_URISCHEME:
+    return as_string(ippGetString(attr, count, &lang));
+  case IPP_TAG_BOOLEAN:
+    return ippGetBoolean(attr, count) ? Qtrue : Qfalse;
+  default:
+    ippAttributeString(attr, block, 4096);
+    printf("[UNSUPPORTED] %s: (%i) %s\n", ippGetName(attr), ippGetValueTag(attr), block);
+
+    return Qnil;
+  }
+}
+
+static VALUE rb_ipp_value(ipp_attribute_t* attr) {
+  int num = ippGetCount(attr), i = 0;
+  VALUE val = Qnil;
+
+  switch (num)  {
+    case 0:
+      return Qnil;
+    case 1:
+      return rb_ipp_value_entry(attr, 0);
+    default:
+      val = rb_ary_new();
+      for(i = 0; i < num; i++) {
+        rb_ary_push(val, rb_ipp_value_entry(attr, i));
+      }
+      return val;
+  }
+}
+
 
 VALUE job_state(ipp_jstate_t state) {
   switch(state) {
@@ -59,52 +126,180 @@ VALUE job_state(ipp_jstate_t state) {
   return INT2FIX(state);
 }
 
-VALUE rb_ipp_value(ipp_attribute_t* attr) {
-  char *lang = NULL;
-  switch (ippGetValueTag(attr)) {
-  case IPP_TAG_INTEGER:
-    return INT2NUM(ippGetInteger(attr, 0));
-  case IPP_TAG_TEXT:
-  case IPP_TAG_NAME:
-  case IPP_TAG_URI:
-  case IPP_TAG_URISCHEME:
-    return as_string(ippGetString(attr, 0, &lang));
-  case IPP_TAG_BOOLEAN:
-    return ippGetBoolean(attr, 0) ? Qtrue : Qfalse;
-  }
-  return Qnil;
+static VALUE renew_subscription(int subscription_id, int duration) {
+  ipp_attribute_t *attr = NULL;
+  http_t *http;
+  ipp_t *request;
+  ipp_t *response;
 
+  if ((http = httpConnectEncrypt(cupsServer(), ippPort(), cupsEncryption ())) == NULL) {
+    return Qnil;
+  }
+
+  request = ippNewRequest (IPP_RENEW_SUBSCRIPTION);
+  ippAddString (request, IPP_TAG_OPERATION, IPP_TAG_URI,
+               "printer-uri", NULL, "/");
+  ippAddString (request, IPP_TAG_OPERATION, IPP_TAG_NAME,
+               "requesting-user-name", NULL, cupsUser());
+  ippAddInteger (request, IPP_TAG_OPERATION, IPP_TAG_INTEGER,
+                "notify-subscription-id", subscription_id);
+  ippAddInteger (request, IPP_TAG_SUBSCRIPTION, IPP_TAG_INTEGER,
+                "notify-lease-duration", duration);
+  ippDelete (cupsDoRequest (http, request, "/"));
+
+  httpClose(http);
+
+  return INT2NUM(subscription_id);
 }
 
-struct svp_it {
-  int num_options;
-  cups_option_t *options;
-};
-
-int hash_to_cups_options_it(VALUE key, VALUE val, VALUE data) {
-  struct svp_it *svp  = (struct svp_it *)data;
-
-  svp->num_options = cupsAddOption(StringValuePtr(key), StringValuePtr(val), svp->num_options, &(svp->options));
-
-  return ST_CONTINUE;
-}
-int add_to_request_iterator(VALUE key, VALUE val, VALUE data) {
-  ipp_t *request = (ipp_t*) data;
-  char *name = RSTRING_PTR(key);
-
-  switch(TYPE(val)) {
-    case T_FIXNUM:
-      ippAddInteger(request, IPP_TAG_OPERATION, IPP_TAG_INTEGER, name, NUM2INT(val));
-      break;
-    case T_STRING:
-      ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_NAME, name, NULL, RSTRING_PTR(val));
-      break;
-    case T_TRUE:
-    case T_FALSE:
-      ippAddBoolean(request, IPP_TAG_OPERATION, name, (val) ? 1 : 0);
-      break;
+static void debug_ipp(ipp_t *ipp) {
+  char block[4096] = "";
+  ipp_attribute_t *attr = NULL;
+  
+   for (attr = ippFirstAttribute(ipp); attr; attr = ippNextAttribute(ipp)) {
+    ippAttributeString(attr, block, 4096);
+    printf("[DEBUG] %s: (%i) %s\n", ippGetName(attr), ippGetValueTag(attr), block);
   }
-  return ST_CONTINUE;
+  
+}
+
+static VALUE create_subscription(int duration, char *uri, char *printer) {
+  ipp_attribute_t *attr = NULL;
+  http_t *http;
+  ipp_t *request;
+  ipp_t *response;
+  VALUE subscription_id = 0;
+  int num_events = 7;
+  static const char * const events[] = {
+    "job-created",
+    "job-completed",
+    "job-state-changed",
+    "job-state",
+    "printer-added",
+    "printer-deleted",
+    "printer-state-changed"
+  };
+
+  if ((http = httpConnectEncrypt(cupsServer(), ippPort(), cupsEncryption())) == NULL) {
+    return Qnil;
+  }
+
+  request = ippNewRequest (IPP_CREATE_PRINTER_SUBSCRIPTION);
+  ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_URI,
+                "printer-uri", NULL, printer);
+  ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_NAME,
+                "requesting-user-name", NULL, cupsUser ());
+  ippAddStrings(request, IPP_TAG_SUBSCRIPTION, IPP_TAG_KEYWORD,
+                 "notify-events", num_events, NULL, events);
+  ippAddString(request, IPP_TAG_SUBSCRIPTION, IPP_TAG_KEYWORD,
+                "notify-pull-method", NULL, "ippget");
+  ippAddString(request, IPP_TAG_SUBSCRIPTION, IPP_TAG_URI,
+                "notify-recipient-uri", NULL, uri);
+  ippAddInteger(request, IPP_TAG_SUBSCRIPTION, IPP_TAG_INTEGER,
+                 "notify-lease-duration", duration);
+  response = cupsDoRequest (http, request, "/");
+
+  if (response != NULL && ippGetStatusCode(response) <= IPP_OK_CONFLICT) {
+    /*debug_ipp(response);*/
+    ippFirstAttribute(response);
+
+    if ((attr = ippFindAttribute(response, "notify-subscription-id", IPP_TAG_INTEGER)) != NULL) {
+      subscription_id = INT2NUM(ippGetInteger(attr, 0));
+    } else {
+      subscription_id = Qnil;
+    }
+  }
+
+  if (response) {
+    ippDelete(response);
+  }
+
+  httpClose (http);
+
+  return subscription_id;
+}
+
+static void
+cancel_subscription(int subscription_id)
+{
+  http_t *http;
+  ipp_t *request;
+
+  if (subscription_id >= 0 &&
+       ((http = httpConnectEncrypt(cupsServer(), ippPort(), cupsEncryption())) != NULL)) {
+
+    request = ippNewRequest(IPP_CANCEL_SUBSCRIPTION);
+    ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_URI,
+                 "printer-uri", NULL, "/");
+    ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_NAME,
+                 "requesting-user-name", NULL, cupsUser());
+    ippAddInteger(request, IPP_TAG_OPERATION, IPP_TAG_INTEGER,
+                  "notify-subscription-id", subscription_id);
+    ippDelete(cupsDoRequest(http, request, "/"));
+
+    httpClose(http);
+  }
+}
+
+static VALUE list_subscriptions(bool my_subscriptions) {
+  ipp_attribute_t *attr = NULL;
+  http_t *http;
+  ipp_t *request;
+  ipp_t *response;
+  VALUE subscription_id = 0;
+  VALUE ary = rb_ary_new();
+  static const char * const req_attr[] = {
+    "all"
+  };
+
+  if ((http = httpConnectEncrypt(cupsServer(), ippPort(), cupsEncryption ())) == NULL) {
+    return Qnil;
+  }
+
+  request = ippNewRequest (IPP_GET_SUBSCRIPTIONS);
+  ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_URI,
+                "printer-uri", NULL, "/");
+  ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_NAME,
+                "requesting-user-name", NULL, cupsUser ());
+  ippAddStrings(request, IPP_TAG_SUBSCRIPTION, IPP_TAG_KEYWORD,
+                 "requested-attributes", 1, NULL, req_attr);
+  ippAddBoolean(request, IPP_TAG_SUBSCRIPTION, "my-subscriptions",
+                 my_subscriptions);
+  response = cupsDoRequest (http, request, "/");
+
+  if (response != NULL && ippGetStatusCode(response) <= IPP_OK_CONFLICT) {
+    char block[4096] = "", *name;
+    VALUE hash = rb_hash_new();
+
+    attr = ippFirstAttribute(response);
+    ippNextAttribute(response);
+    ippNextAttribute(response);
+
+    rb_ary_push(ary, hash);
+
+    for (; attr != NULL; attr = ippNextAttribute(response)) {
+      name = ippGetName(attr);
+
+      if (name == NULL) {
+        hash = rb_hash_new();
+        rb_ary_push(ary, hash);
+      } else {
+        rb_hash_aset(hash, as_string(name), rb_ipp_value(attr));
+        /*puts(ippGetName(attr));
+        if (ippAttributeString(attr, block, 4096) > 0) {
+          puts(block);
+        }*/
+      }
+    }
+  }
+
+  if (response) {
+    ippDelete(response);
+  }
+
+  httpClose (http);
+
+  return ary;
 }
 
 %}
@@ -180,7 +375,6 @@ module Noggin
         rb_hash_aset(options, as_string(dest->options[j].name), as_string(dest->options[j].value));
       }
 
-
       rb_ary_push(list, hash);
     }
 
@@ -220,29 +414,6 @@ module Noggin
     return list;
   end
 
-  class IppRequest
-
-  end
-
-  def self.ippRequest(int operation, VALUE request_attributes)
-    VALUE resp = Qnil;
-    ipp_t *request = NULL , *response = NULL;
-    ipp_attribute_t *attr = NULL;
-
-    request = ippNewRequest(operation);
-    rb_hash_foreach(request_attributes, add_to_request_iterator, (VALUE)request);
-
-    response = cupsDoRequest(CUPS_HTTP_DEFAULT, request, "/");
-
-    resp = rb_hash_new();
-
-    for (attr = ippFirstAttribute(response); attr != NULL; attr = ippNextAttribute(response)) {
-      rb_hash_aset(resp, as_string(ippGetName(attr)), rb_ipp_value(attr));
-    }
-
-    return resp;
-  end
-
   def int:self.printFile(char *destinationName, char *fileName, char *title, T_HASH|T_NIL options = Qnil)
     struct svp_it info = {0, NULL};
     int job_id = -1;
@@ -258,5 +429,20 @@ module Noggin
     }
 
     return job_id;
+  end
+
+  module Subscription
+    def self.create(int duration=0, char *notify_uri="dbus://", char *printer="/")
+      return create_subscription(duration, notify_uri, printer);
+    end
+    def self.renew(int id, int duration=0)
+      return renew_subscription(id, duration);
+    end
+    def self.cancel(int id)
+      cancel_subscription(id);
+    end
+    def self.list(bool my_subscriptions=1)
+      return list_subscriptions(my_subscriptions);
+    end
   end
 end

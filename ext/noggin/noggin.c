@@ -1,9 +1,14 @@
 #pragma GCC diagnostic ignored "-Wunused-but-set-variable"
-/* Includes */
-#include <ruby.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
+  /* Includes */
+  #include <ruby.h>
+  #include <stdlib.h>
+  #include <stdio.h>
+  #include <string.h>
+  #if defined GCC
+    #define OPTIONAL_ATTR __attribute__((unused))
+  #else
+    #define OPTIONAL_ATTR
+  #endif
 #include "cups/cups.h"
 #include "cups/ipp.h"
 #include "ruby.h"
@@ -17,18 +22,24 @@ typedef int rubber_bool;
 /* Prototypes */
 static VALUE mNoggin;
 static VALUE
-Noggin_CLASS_destinations(VALUE self);
+Noggin_CLASS_destinations(VALUE self OPTIONAL_ATTR );
 static VALUE
-Noggin_CLASS_jobs(VALUE self, VALUE printer, VALUE __v_mine, VALUE __v_whichjobs);
-static VALUE
-Noggin_CLASS_ippRequest(VALUE self, VALUE __v_operation, VALUE request_attributes);
+Noggin_CLASS_jobs(VALUE self OPTIONAL_ATTR , VALUE printer OPTIONAL_ATTR, VALUE __v_mine OPTIONAL_ATTR, VALUE __v_whichjobs OPTIONAL_ATTR);
 static VALUE
 Noggin_CLASS_printFile(int __p_argc, VALUE *__p_argv, VALUE self);
 static VALUE mJob;
 static VALUE
-Job_CLASS_cancel(VALUE self, VALUE __v_printer, VALUE __v_job_id);
+Job_CLASS_cancel(VALUE self OPTIONAL_ATTR , VALUE __v_printer OPTIONAL_ATTR, VALUE __v_job_id OPTIONAL_ATTR);
 static VALUE mIPP;
-static VALUE cIppRequest;
+static VALUE mSubscription;
+static VALUE
+Subscription_CLASS_create(int __p_argc, VALUE *__p_argv, VALUE self);
+static VALUE
+Subscription_CLASS_renew(int __p_argc, VALUE *__p_argv, VALUE self);
+static VALUE
+Subscription_CLASS_cancel(VALUE self OPTIONAL_ATTR , VALUE __v_id OPTIONAL_ATTR);
+static VALUE
+Subscription_CLASS_list(int __p_argc, VALUE *__p_argv, VALUE self);
 static VALUE _gcpool_Keep = Qnil;
 static void __gcpool_Keep_add(VALUE val);
 static void __gcpool_Keep_del(VALUE val);
@@ -38,7 +49,7 @@ static void __gcpool_Keep_del(VALUE val);
 /* Inline C code */
 
 
-VALUE inline as_string(const char *string) { return string ? rb_str_new2(string) : Qnil;  }
+inline VALUE as_string(const char *string) { return string ? rb_str_new2(string) : Qnil;  }
 
 #define TO_STRING(v) ((v) ? rb_str_new2((v)) : Qnil)
 
@@ -50,6 +61,7 @@ static VALUE sym_pending = Qnil;
 static VALUE sym_processing = Qnil;
 static VALUE sym_stopped = Qnil;
 
+#define SUBSCRIPTION_DURATION 3600
 #define STATIC_STR(name) static VALUE str_##name = Qnil;
 #define STATIC_STR_INIT(name) KEEP_ADD(str_##name = rb_str_new2(#name)); rb_obj_freeze(str_##name);
 STATIC_STR(completed_time);
@@ -68,6 +80,72 @@ STATIC_STR(name);
 STATIC_STR(instance);
 STATIC_STR(is_default);
 STATIC_STR(options);
+
+struct svp_it {
+  int num_options;
+  cups_option_t *options;
+};
+
+int hash_to_cups_options_it(VALUE key, VALUE val, VALUE data) {
+  struct svp_it *svp  = (struct svp_it *)data;
+  svp->num_options = cupsAddOption(StringValuePtr(key), StringValuePtr(val), svp->num_options, &(svp->options));
+  return ST_CONTINUE;
+}
+
+static VALUE rb_ipp_value_entry(ipp_attribute_t* attr, int count) {
+  char *lang = NULL;
+  char block[4096] = "";
+ 
+  /*char block[4096] = "";
+  ippAttributeString(attr, block, 4096);
+  printf("%s: (0x%x) %s\n", ippGetName(attr), ippGetValueTag(attr), block);*/
+
+  switch (ippGetValueTag(attr)) {
+  case IPP_TAG_INTEGER:
+    return INT2NUM(ippGetInteger(attr, count));
+  case IPP_TAG_RESERVED_STRING:
+  case IPP_TAG_STRING:
+  case IPP_TAG_SUBSCRIPTION:
+  case IPP_TAG_TEXT:
+  case IPP_TAG_NAME:
+  case IPP_TAG_KEYWORD:
+  case IPP_TAG_URI:
+  case IPP_TAG_TEXTLANG:
+  case IPP_TAG_NAMELANG:
+  case IPP_TAG_LANGUAGE:
+  case IPP_TAG_CHARSET:
+  case IPP_TAG_MIMETYPE:
+  case IPP_TAG_MEMBERNAME:
+  case IPP_TAG_URISCHEME:
+    return as_string(ippGetString(attr, count, &lang));
+  case IPP_TAG_BOOLEAN:
+    return ippGetBoolean(attr, count) ? Qtrue : Qfalse;
+  default:
+    ippAttributeString(attr, block, 4096);
+    printf("[UNSUPPORTED] %s: (%i) %s\n", ippGetName(attr), ippGetValueTag(attr), block);
+
+    return Qnil;
+  }
+}
+
+static VALUE rb_ipp_value(ipp_attribute_t* attr) {
+  int num = ippGetCount(attr), i = 0;
+  VALUE val = Qnil;
+
+  switch (num)  {
+    case 0:
+      return Qnil;
+    case 1:
+      return rb_ipp_value_entry(attr, 0);
+    default:
+      val = rb_ary_new();
+      for(i = 0; i < num; i++) {
+        rb_ary_push(val, rb_ipp_value_entry(attr, i));
+      }
+      return val;
+  }
+}
+
 
 VALUE job_state(ipp_jstate_t state) {
   switch(state) {
@@ -89,62 +167,190 @@ VALUE job_state(ipp_jstate_t state) {
   return INT2FIX(state);
 }
 
-VALUE rb_ipp_value(ipp_attribute_t* attr) {
-  char *lang = NULL;
-  switch (ippGetValueTag(attr)) {
-  case IPP_TAG_INTEGER:
-    return INT2NUM(ippGetInteger(attr, 0));
-  case IPP_TAG_TEXT:
-  case IPP_TAG_NAME:
-  case IPP_TAG_URI:
-  case IPP_TAG_URISCHEME:
-    return as_string(ippGetString(attr, 0, &lang));
-  case IPP_TAG_BOOLEAN:
-    return ippGetBoolean(attr, 0) ? Qtrue : Qfalse;
-  }
-  return Qnil;
+static VALUE renew_subscription(int subscription_id, int duration) {
+  ipp_attribute_t *attr = NULL;
+  http_t *http;
+  ipp_t *request;
+  ipp_t *response;
 
+  if ((http = httpConnectEncrypt(cupsServer(), ippPort(), cupsEncryption ())) == NULL) {
+    return Qnil;
+  }
+
+  request = ippNewRequest (IPP_RENEW_SUBSCRIPTION);
+  ippAddString (request, IPP_TAG_OPERATION, IPP_TAG_URI,
+               "printer-uri", NULL, "/");
+  ippAddString (request, IPP_TAG_OPERATION, IPP_TAG_NAME,
+               "requesting-user-name", NULL, cupsUser());
+  ippAddInteger (request, IPP_TAG_OPERATION, IPP_TAG_INTEGER,
+                "notify-subscription-id", subscription_id);
+  ippAddInteger (request, IPP_TAG_SUBSCRIPTION, IPP_TAG_INTEGER,
+                "notify-lease-duration", duration);
+  ippDelete (cupsDoRequest (http, request, "/"));
+
+  httpClose(http);
+
+  return INT2NUM(subscription_id);
 }
 
-struct svp_it {
-  int num_options;
-  cups_option_t *options;
-};
-
-int hash_to_cups_options_it(VALUE key, VALUE val, VALUE data) {
-  struct svp_it *svp  = (struct svp_it *)data;
-
-  svp->num_options = cupsAddOption(StringValuePtr(key), StringValuePtr(val), svp->num_options, &(svp->options));
-
-  return ST_CONTINUE;
-}
-int add_to_request_iterator(VALUE key, VALUE val, VALUE data) {
-  ipp_t *request = (ipp_t*) data;
-  char *name = RSTRING_PTR(key);
-
-  switch(TYPE(val)) {
-    case T_FIXNUM:
-      ippAddInteger(request, IPP_TAG_OPERATION, IPP_TAG_INTEGER, name, NUM2INT(val));
-      break;
-    case T_STRING:
-      ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_NAME, name, NULL, RSTRING_PTR(val));
-      break;
-    case T_TRUE:
-    case T_FALSE:
-      ippAddBoolean(request, IPP_TAG_OPERATION, name, (val) ? 1 : 0);
-      break;
+static void debug_ipp(ipp_t *ipp) {
+  char block[4096] = "";
+  ipp_attribute_t *attr = NULL;
+  
+   for (attr = ippFirstAttribute(ipp); attr; attr = ippNextAttribute(ipp)) {
+    ippAttributeString(attr, block, 4096);
+    printf("[DEBUG] %s: (%i) %s\n", ippGetName(attr), ippGetValueTag(attr), block);
   }
-  return ST_CONTINUE;
+  
+}
+
+static VALUE create_subscription(int duration, char *uri, char *printer) {
+  ipp_attribute_t *attr = NULL;
+  http_t *http;
+  ipp_t *request;
+  ipp_t *response;
+  VALUE subscription_id = 0;
+  int num_events = 7;
+  static const char * const events[] = {
+    "job-created",
+    "job-completed",
+    "job-state-changed",
+    "job-state",
+    "printer-added",
+    "printer-deleted",
+    "printer-state-changed"
+  };
+
+  if ((http = httpConnectEncrypt(cupsServer(), ippPort(), cupsEncryption())) == NULL) {
+    return Qnil;
+  }
+
+  request = ippNewRequest (IPP_CREATE_PRINTER_SUBSCRIPTION);
+  ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_URI,
+                "printer-uri", NULL, printer);
+  ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_NAME,
+                "requesting-user-name", NULL, cupsUser ());
+  ippAddStrings(request, IPP_TAG_SUBSCRIPTION, IPP_TAG_KEYWORD,
+                 "notify-events", num_events, NULL, events);
+  ippAddString(request, IPP_TAG_SUBSCRIPTION, IPP_TAG_KEYWORD,
+                "notify-pull-method", NULL, "ippget");
+  ippAddString(request, IPP_TAG_SUBSCRIPTION, IPP_TAG_URI,
+                "notify-recipient-uri", NULL, uri);
+  ippAddInteger(request, IPP_TAG_SUBSCRIPTION, IPP_TAG_INTEGER,
+                 "notify-lease-duration", duration);
+  response = cupsDoRequest (http, request, "/");
+
+  if (response != NULL && ippGetStatusCode(response) <= IPP_OK_CONFLICT) {
+    /*debug_ipp(response);*/
+    ippFirstAttribute(response);
+
+    if ((attr = ippFindAttribute(response, "notify-subscription-id", IPP_TAG_INTEGER)) != NULL) {
+      subscription_id = INT2NUM(ippGetInteger(attr, 0));
+    } else {
+      subscription_id = Qnil;
+    }
+  }
+
+  if (response) {
+    ippDelete(response);
+  }
+
+  httpClose (http);
+
+  return subscription_id;
+}
+
+static void
+cancel_subscription(int subscription_id)
+{
+  http_t *http;
+  ipp_t *request;
+
+  if (subscription_id >= 0 &&
+       ((http = httpConnectEncrypt(cupsServer(), ippPort(), cupsEncryption())) != NULL)) {
+
+    request = ippNewRequest(IPP_CANCEL_SUBSCRIPTION);
+    ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_URI,
+                 "printer-uri", NULL, "/");
+    ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_NAME,
+                 "requesting-user-name", NULL, cupsUser());
+    ippAddInteger(request, IPP_TAG_OPERATION, IPP_TAG_INTEGER,
+                  "notify-subscription-id", subscription_id);
+    ippDelete(cupsDoRequest(http, request, "/"));
+
+    httpClose(http);
+  }
+}
+
+static VALUE list_subscriptions(bool my_subscriptions) {
+  ipp_attribute_t *attr = NULL;
+  http_t *http;
+  ipp_t *request;
+  ipp_t *response;
+  VALUE subscription_id = 0;
+  VALUE ary = rb_ary_new();
+  static const char * const req_attr[] = {
+    "all"
+  };
+
+  if ((http = httpConnectEncrypt(cupsServer(), ippPort(), cupsEncryption ())) == NULL) {
+    return Qnil;
+  }
+
+  request = ippNewRequest (IPP_GET_SUBSCRIPTIONS);
+  ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_URI,
+                "printer-uri", NULL, "/");
+  ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_NAME,
+                "requesting-user-name", NULL, cupsUser ());
+  ippAddStrings(request, IPP_TAG_SUBSCRIPTION, IPP_TAG_KEYWORD,
+                 "requested-attributes", 1, NULL, req_attr);
+  ippAddBoolean(request, IPP_TAG_SUBSCRIPTION, "my-subscriptions",
+                 my_subscriptions);
+  response = cupsDoRequest (http, request, "/");
+
+  if (response != NULL && ippGetStatusCode(response) <= IPP_OK_CONFLICT) {
+    char block[4096] = "", *name;
+    VALUE hash = rb_hash_new();
+
+    attr = ippFirstAttribute(response);
+    ippNextAttribute(response);
+    ippNextAttribute(response);
+
+    rb_ary_push(ary, hash);
+
+    for (; attr != NULL; attr = ippNextAttribute(response)) {
+      name = ippGetName(attr);
+
+      if (name == NULL) {
+        hash = rb_hash_new();
+        rb_ary_push(ary, hash);
+      } else {
+        rb_hash_aset(hash, as_string(name), rb_ipp_value(attr));
+        /*puts(ippGetName(attr));
+        if (ippAttributeString(attr, block, 4096) > 0) {
+          puts(block);
+        }*/
+      }
+    }
+  }
+
+  if (response) {
+    ippDelete(response);
+  }
+
+  httpClose (http);
+
+  return ary;
 }
 
 
 /* Code */
 static VALUE
-Noggin_CLASS_destinations(VALUE self)
+Noggin_CLASS_destinations(VALUE self OPTIONAL_ATTR )
 {
-  VALUE __p_retval = Qnil;
+  VALUE __p_retval OPTIONAL_ATTR = Qnil;
 
-#line 161 "/home/geoff/Projects/noggin/ext/noggin/noggin.cr"
+#line 356 "/home/geoff/Projects/noggin/ext/noggin/noggin.cr"
 
   do {
   VALUE  list  =
@@ -178,9 +384,9 @@ out:
 }
 
 static VALUE
-Noggin_CLASS_jobs(VALUE self, VALUE printer, VALUE __v_mine, VALUE __v_whichjobs)
+Noggin_CLASS_jobs(VALUE self OPTIONAL_ATTR , VALUE printer OPTIONAL_ATTR, VALUE __v_mine OPTIONAL_ATTR, VALUE __v_whichjobs OPTIONAL_ATTR)
 {
-  VALUE __p_retval = Qnil;
+  VALUE __p_retval OPTIONAL_ATTR = Qnil;
   bool mine; bool __orig_mine;
   int whichjobs; int __orig_whichjobs;
   if (! ((TYPE(printer) == T_NIL) || (TYPE(printer) == T_STRING)) )
@@ -188,7 +394,7 @@ Noggin_CLASS_jobs(VALUE self, VALUE printer, VALUE __v_mine, VALUE __v_whichjobs
   __orig_mine = mine = RTEST(__v_mine);
   __orig_whichjobs = whichjobs = NUM2INT(__v_whichjobs);
 
-#line 192 "/home/geoff/Projects/noggin/ext/noggin/noggin.cr"
+#line 386 "/home/geoff/Projects/noggin/ext/noggin/noggin.cr"
 
   do {
   VALUE  list  =
@@ -223,40 +429,9 @@ out:
 }
 
 static VALUE
-Noggin_CLASS_ippRequest(VALUE self, VALUE __v_operation, VALUE request_attributes)
-{
-  VALUE __p_retval = Qnil;
-  int operation; int __orig_operation;
-  __orig_operation = operation = NUM2INT(__v_operation);
-
-#line 227 "/home/geoff/Projects/noggin/ext/noggin/noggin.cr"
-
-  do {
-  VALUE  resp  =
- Qnil;
-  ipp_t * request  =
- NULL , *response = NULL;
-  ipp_attribute_t * attr  =
- NULL;
-  request = ippNewRequest(operation);
-  rb_hash_foreach(request_attributes, add_to_request_iterator, (VALUE)request);
-  response = cupsDoRequest(CUPS_HTTP_DEFAULT, request, "/");
-  resp = rb_hash_new();
-  for (attr = ippFirstAttribute(response);
-  attr != NULL;
-  attr = ippNextAttribute(response)) { rb_hash_aset(resp, as_string(ippGetName(attr)), rb_ipp_value(attr));
-  } do { __p_retval = resp; goto out; } while(0);
-
-  } while(0);
-
-out:
-  return __p_retval;
-}
-
-static VALUE
 Noggin_CLASS_printFile(int __p_argc, VALUE *__p_argv, VALUE self)
 {
-  VALUE __p_retval = Qnil;
+  VALUE __p_retval OPTIONAL_ATTR = Qnil;
   VALUE __v_destinationName = Qnil;
   char * destinationName; char * __orig_destinationName;
   VALUE __v_fileName = Qnil;
@@ -282,7 +457,7 @@ Noggin_CLASS_printFile(int __p_argc, VALUE *__p_argv, VALUE self)
     rb_raise(rb_eArgError, "options argument must be one of Hash, Nil");
 
 
-#line 246 "/home/geoff/Projects/noggin/ext/noggin/noggin.cr"
+#line 417 "/home/geoff/Projects/noggin/ext/noggin/noggin.cr"
 
   do {
   struct svp_it  info  =
@@ -300,17 +475,116 @@ out:
 }
 
 static VALUE
-Job_CLASS_cancel(VALUE self, VALUE __v_printer, VALUE __v_job_id)
+Job_CLASS_cancel(VALUE self OPTIONAL_ATTR , VALUE __v_printer OPTIONAL_ATTR, VALUE __v_job_id OPTIONAL_ATTR)
 {
   char * printer; char * __orig_printer;
   int job_id; int __orig_job_id;
   __orig_printer = printer = ( NIL_P(__v_printer) ? NULL : StringValuePtr(__v_printer) );
   __orig_job_id = job_id = NUM2INT(__v_job_id);
 
-#line 152 "/home/geoff/Projects/noggin/ext/noggin/noggin.cr"
+#line 347 "/home/geoff/Projects/noggin/ext/noggin/noggin.cr"
   if (cupsCancelJob(printer, job_id) == 0) { rb_raise(rb_eRuntimeError, "CUPS Error: %d - %s", cupsLastError(), cupsLastErrorString());
   }
   return Qnil;
+}
+
+static VALUE
+Subscription_CLASS_create(int __p_argc, VALUE *__p_argv, VALUE self)
+{
+  VALUE __p_retval OPTIONAL_ATTR = Qnil;
+  VALUE __v_duration = Qnil;
+  int duration; int __orig_duration;
+  VALUE __v_notify_uri = Qnil;
+  char * notify_uri; char * __orig_notify_uri;
+  VALUE __v_printer = Qnil;
+  char * printer; char * __orig_printer;
+
+  /* Scan arguments */
+  rb_scan_args(__p_argc, __p_argv, "03",&__v_duration, &__v_notify_uri, &__v_printer);
+
+  /* Set defaults */
+  if (__p_argc > 0)
+    __orig_duration = duration = NUM2INT(__v_duration);
+  else
+    duration = 0;
+
+  if (__p_argc > 1)
+    __orig_notify_uri = notify_uri = ( NIL_P(__v_notify_uri) ? NULL : StringValuePtr(__v_notify_uri) );
+  else
+    notify_uri = "dbus://";
+
+  if (__p_argc > 2)
+    __orig_printer = printer = ( NIL_P(__v_printer) ? NULL : StringValuePtr(__v_printer) );
+  else
+    printer = "/";
+
+
+#line 435 "/home/geoff/Projects/noggin/ext/noggin/noggin.cr"
+  do { __p_retval = create_subscription(duration, notify_uri, printer); goto out; } while(0);
+out:
+  return __p_retval;
+}
+
+static VALUE
+Subscription_CLASS_renew(int __p_argc, VALUE *__p_argv, VALUE self)
+{
+  VALUE __p_retval OPTIONAL_ATTR = Qnil;
+  VALUE __v_id = Qnil;
+  int id; int __orig_id;
+  VALUE __v_duration = Qnil;
+  int duration; int __orig_duration;
+
+  /* Scan arguments */
+  rb_scan_args(__p_argc, __p_argv, "11",&__v_id, &__v_duration);
+
+  /* Set defaults */
+  __orig_id = id = NUM2INT(__v_id);
+
+  if (__p_argc > 1)
+    __orig_duration = duration = NUM2INT(__v_duration);
+  else
+    duration = 0;
+
+
+#line 438 "/home/geoff/Projects/noggin/ext/noggin/noggin.cr"
+  do { __p_retval = renew_subscription(id, duration); goto out; } while(0);
+out:
+  return __p_retval;
+}
+
+static VALUE
+Subscription_CLASS_cancel(VALUE self OPTIONAL_ATTR , VALUE __v_id OPTIONAL_ATTR)
+{
+  int id; int __orig_id;
+  __orig_id = id = NUM2INT(__v_id);
+
+#line 441 "/home/geoff/Projects/noggin/ext/noggin/noggin.cr"
+  cancel_subscription(id);
+ 
+  return Qnil;
+}
+
+static VALUE
+Subscription_CLASS_list(int __p_argc, VALUE *__p_argv, VALUE self)
+{
+  VALUE __p_retval OPTIONAL_ATTR = Qnil;
+  VALUE __v_my_subscriptions = Qnil;
+  bool my_subscriptions; bool __orig_my_subscriptions;
+
+  /* Scan arguments */
+  rb_scan_args(__p_argc, __p_argv, "01",&__v_my_subscriptions);
+
+  /* Set defaults */
+  if (__p_argc > 0)
+    __orig_my_subscriptions = my_subscriptions = RTEST(__v_my_subscriptions);
+  else
+    my_subscriptions = 1;
+
+
+#line 444 "/home/geoff/Projects/noggin/ext/noggin/noggin.cr"
+  do { __p_retval = list_subscriptions(my_subscriptions); goto out; } while(0);
+out:
+  return __p_retval;
 }
 
 static void __gcpool_Keep_add(VALUE val)
@@ -345,7 +619,6 @@ Init_noggin(void)
   mNoggin = rb_define_module("Noggin");
   rb_define_singleton_method(mNoggin, "destinations", Noggin_CLASS_destinations, 0);
   rb_define_singleton_method(mNoggin, "jobs", Noggin_CLASS_jobs, 3);
-  rb_define_singleton_method(mNoggin, "ippRequest", Noggin_CLASS_ippRequest, 2);
   rb_define_singleton_method(mNoggin, "printFile", Noggin_CLASS_printFile, -1);
     rb_define_const(mNoggin, "WHICHJOBS_ALL", INT2NUM(CUPS_WHICHJOBS_ALL));
     rb_define_const(mNoggin, "WHICHJOBS_ACTIVE", INT2NUM(CUPS_WHICHJOBS_ACTIVE));
@@ -356,7 +629,11 @@ Init_noggin(void)
     rb_define_const(mJob, "ALL", INT2NUM(CUPS_JOBID_ALL));
   mIPP = rb_define_module_under(mNoggin, "IPP");
     rb_define_const(mIPP, "GET_JOBS", INT2NUM(IPP_GET_JOBS));
-  cIppRequest = rb_define_class_under(mNoggin, "IppRequest", rb_cObject);
+  mSubscription = rb_define_module_under(mNoggin, "Subscription");
+  rb_define_singleton_method(mSubscription, "create", Subscription_CLASS_create, -1);
+  rb_define_singleton_method(mSubscription, "renew", Subscription_CLASS_renew, -1);
+  rb_define_singleton_method(mSubscription, "cancel", Subscription_CLASS_cancel, 1);
+  rb_define_singleton_method(mSubscription, "list", Subscription_CLASS_list, -1);
 rb_gc_register_address(&_gcpool_Keep);
 
   KEEP_ADD(sym_cancelled = ID2SYM(rb_intern("cancelled")));

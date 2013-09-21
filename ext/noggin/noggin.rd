@@ -5,9 +5,6 @@
 --- Noggin.jobs(String printer, Boolean mine, Integer whichjobs)
 
 
---- Noggin.ippRequest(Integer operation, request_attributes)
-
-
 --- Noggin.printFile(String destinationName, String fileName, String title, Hash options)
 
 
@@ -22,4 +19,16 @@
 === Noggin::Job::ALL
 == module Noggin::IPP
 === Noggin::IPP::GET_JOBS
-== class Noggin::IppRequest
+== module Noggin::Subscription
+--- Noggin::Subscription.create(Integer duration, String notify_uri, String printer)
+
+
+--- Noggin::Subscription.renew(Integer id, Integer duration)
+
+
+--- Noggin::Subscription.cancel(Integer id)
+
+
+--- Noggin::Subscription.list(Boolean my_subscriptions)
+
+

@@ -7,10 +7,23 @@
 %lib cups
 
 %{
+inline VALUE as_string(const char *string);
+int hash_to_cups_options_it(VALUE key, VALUE val, VALUE data);
+static VALUE rb_ipp_value_entry(ipp_attribute_t* attr, int count);
+static VALUE rb_ipp_value(ipp_attribute_t* attr);
+VALUE job_state(ipp_jstate_t state);
+static VALUE renew_subscription(int subscription_id, int duration);
+static void debug_ipp(ipp_t *ipp);
+static VALUE create_subscription(int duration, char *uri, char *printer);
+static void cancel_subscription(int subscription_id);
+static VALUE list_subscriptions(bool my_subscriptions);
 
-inline VALUE as_string(const char *string) { return string ? rb_str_new2(string) : Qnil;  }
 
-#define TO_STRING(v) ((v) ? rb_str_new2((v)) : Qnil)
+
+inline VALUE as_string(const char *string)
+{
+  return string ? rb_str_new2(string) : Qnil;
+}
 
 static VALUE sym_aborted = Qnil;
 static VALUE sym_cancelled = Qnil;
@@ -22,7 +35,7 @@ static VALUE sym_stopped = Qnil;
 
 #define SUBSCRIPTION_DURATION 3600
 #define STATIC_STR(name) static VALUE str_##name = Qnil;
-#define STATIC_STR_INIT(name) KEEP_ADD(str_##name = rb_str_new2(#name)); rb_obj_freeze(str_##name);
+#define STATIC_STR_INIT(name) KEEP_ADD(str_##name = rb_str_new2(#name));
 STATIC_STR(completed_time);
 STATIC_STR(creation_time);
 STATIC_STR(dest);
@@ -45,14 +58,16 @@ struct svp_it {
   cups_option_t *options;
 };
 
-int hash_to_cups_options_it(VALUE key, VALUE val, VALUE data) {
+int hash_to_cups_options_it(VALUE key, VALUE val, VALUE data)
+{
   struct svp_it *svp  = (struct svp_it *)data;
   svp->num_options = cupsAddOption(StringValuePtr(key), StringValuePtr(val), svp->num_options, &(svp->options));
   return ST_CONTINUE;
 }
 
-static VALUE rb_ipp_value_entry(ipp_attribute_t* attr, int count) {
-  char *lang = NULL;
+static VALUE rb_ipp_value_entry(ipp_attribute_t* attr, int count)
+{
+  const char *lang = NULL;
   char block[4096] = "";
  
   /*char block[4096] = "";
@@ -61,7 +76,10 @@ static VALUE rb_ipp_value_entry(ipp_attribute_t* attr, int count) {
 
   switch (ippGetValueTag(attr)) {
   case IPP_TAG_INTEGER:
+  case IPP_TAG_JOB:
     return INT2NUM(ippGetInteger(attr, count));
+  case IPP_TAG_ZERO:
+    return INT2FIX(0);
   case IPP_TAG_RESERVED_STRING:
   case IPP_TAG_STRING:
   case IPP_TAG_SUBSCRIPTION:
@@ -79,6 +97,32 @@ static VALUE rb_ipp_value_entry(ipp_attribute_t* attr, int count) {
     return as_string(ippGetString(attr, count, &lang));
   case IPP_TAG_BOOLEAN:
     return ippGetBoolean(attr, count) ? Qtrue : Qfalse;
+  case IPP_TAG_CUPS_INVALID:
+    return Qnil;
+/* Are these just groups tags? */
+  case IPP_TAG_OPERATION:
+  case IPP_TAG_END:
+  case IPP_TAG_PRINTER:
+  case IPP_TAG_UNSUPPORTED_GROUP:
+  case IPP_TAG_EVENT_NOTIFICATION:
+  case IPP_TAG_RESOURCE:
+  case IPP_TAG_DOCUMENT:
+  case IPP_TAG_UNSUPPORTED_VALUE:
+  case IPP_TAG_DEFAULT:
+  case IPP_TAG_UNKNOWN:
+  case IPP_TAG_NOVALUE:
+  case IPP_TAG_NOTSETTABLE:
+  case IPP_TAG_DELETEATTR:
+  case IPP_TAG_ADMINDEFINE:
+  case IPP_TAG_ENUM:
+  case IPP_TAG_DATE:
+  case IPP_TAG_RESOLUTION:
+  case IPP_TAG_RANGE:
+  case IPP_TAG_BEGIN_COLLECTION:
+  case IPP_TAG_END_COLLECTION:
+  case IPP_TAG_EXTENSION:
+  case IPP_TAG_MASK:
+  case IPP_TAG_COPY:
   default:
     ippAttributeString(attr, block, 4096);
     printf("[UNSUPPORTED] %s: (%i) %s\n", ippGetName(attr), ippGetValueTag(attr), block);
@@ -87,7 +131,8 @@ static VALUE rb_ipp_value_entry(ipp_attribute_t* attr, int count) {
   }
 }
 
-static VALUE rb_ipp_value(ipp_attribute_t* attr) {
+static VALUE rb_ipp_value(ipp_attribute_t* attr)
+{
   int num = ippGetCount(attr), i = 0;
   VALUE val = Qnil;
 
@@ -106,8 +151,10 @@ static VALUE rb_ipp_value(ipp_attribute_t* attr) {
 }
 
 
-VALUE job_state(ipp_jstate_t state) {
-  switch(state) {
+VALUE job_state(ipp_jstate_t state)
+{
+  switch(state)
+  {
     case IPP_JOB_ABORTED:
       return sym_aborted;
     case IPP_JOB_CANCELED:
@@ -122,15 +169,15 @@ VALUE job_state(ipp_jstate_t state) {
       return sym_processing;
     case IPP_JOB_STOPPED:
       return sym_stopped;
-  }
-  return INT2FIX(state);
+    default:
+      return INT2FIX(state);
+   }
 }
 
-static VALUE renew_subscription(int subscription_id, int duration) {
-  ipp_attribute_t *attr = NULL;
+static VALUE renew_subscription(int subscription_id, int duration)
+{
   http_t *http;
   ipp_t *request;
-  ipp_t *response;
 
   if ((http = httpConnectEncrypt(cupsServer(), ippPort(), cupsEncryption ())) == NULL) {
     return Qnil;
@@ -152,7 +199,8 @@ static VALUE renew_subscription(int subscription_id, int duration) {
   return INT2NUM(subscription_id);
 }
 
-static void debug_ipp(ipp_t *ipp) {
+static void debug_ipp(ipp_t *ipp)
+{
   char block[4096] = "";
   ipp_attribute_t *attr = NULL;
   
@@ -163,7 +211,8 @@ static void debug_ipp(ipp_t *ipp) {
   
 }
 
-static VALUE create_subscription(int duration, char *uri, char *printer) {
+static VALUE create_subscription(int duration, char *uri, char *printer)
+{
   ipp_attribute_t *attr = NULL;
   http_t *http;
   ipp_t *request;
@@ -219,8 +268,7 @@ static VALUE create_subscription(int duration, char *uri, char *printer) {
   return subscription_id;
 }
 
-static void
-cancel_subscription(int subscription_id)
+static void cancel_subscription(int subscription_id)
 {
   http_t *http;
   ipp_t *request;
@@ -241,12 +289,12 @@ cancel_subscription(int subscription_id)
   }
 }
 
-static VALUE list_subscriptions(bool my_subscriptions) {
+static VALUE list_subscriptions(bool my_subscriptions)
+{
   ipp_attribute_t *attr = NULL;
   http_t *http;
   ipp_t *request;
   ipp_t *response;
-  VALUE subscription_id = 0;
   VALUE ary = rb_ary_new();
   static const char * const req_attr[] = {
     "all"
@@ -267,8 +315,12 @@ static VALUE list_subscriptions(bool my_subscriptions) {
                  my_subscriptions);
   response = cupsDoRequest (http, request, "/");
 
-  if (response != NULL && ippGetStatusCode(response) <= IPP_OK_CONFLICT) {
-    char block[4096] = "", *name;
+  if (response == NULL) {
+    goto out;
+  }
+
+  if (ippGetStatusCode(response) <= IPP_OK_CONFLICT) {
+    const char *name;
     VALUE hash = rb_hash_new();
 
     attr = ippFirstAttribute(response);
@@ -285,18 +337,17 @@ static VALUE list_subscriptions(bool my_subscriptions) {
         rb_ary_push(ary, hash);
       } else {
         rb_hash_aset(hash, as_string(name), rb_ipp_value(attr));
-        /*puts(ippGetName(attr));
+        /*{ char block[4096] = ""; puts(ippGetName(attr));
         if (ippAttributeString(attr, block, 4096) > 0) {
           puts(block);
-        }*/
+        }}*/
       }
     }
   }
 
-  if (response) {
-    ippDelete(response);
-  }
+  ippDelete(response);
 
+out:
   httpClose (http);
 
   return ary;
@@ -305,6 +356,7 @@ static VALUE list_subscriptions(bool my_subscriptions) {
 %}
 
 %post_init{
+  KEEP_DEL(Qnil);
   KEEP_ADD(sym_cancelled = ID2SYM(rb_intern("cancelled")));
   KEEP_ADD(sym_completed = ID2SYM(rb_intern("completed")));
   KEEP_ADD(sym_held = ID2SYM(rb_intern("held")));
@@ -359,7 +411,6 @@ module Noggin
     int num_dests = cupsGetDests(&dests);
     cups_dest_t *dest;
     int i;
-    const char *value;
     int j;
 
     list = rb_ary_new2(num_dests);
@@ -372,7 +423,7 @@ module Noggin
       rb_hash_aset(hash, str_options, options);
 
       for (j = 0; j < dest->num_options; j++) {
-        rb_hash_aset(options, as_string(dest->options[j].name), as_string(dest->options[j].value));
+        rb_hash_aset(options, as_string((dest->options[j].name)), as_string((dest->options[j].value)));
       }
 
       rb_ary_push(list, hash);
@@ -432,7 +483,7 @@ module Noggin
   end
 
   module Subscription
-    def self.create(int duration=0, char *notify_uri="dbus://", char *printer="/")
+    def self.create(int duration=0, char *notify_uri=(char*)"dbus://", char *printer=(char*)"/")
       return create_subscription(duration, notify_uri, printer);
     end
     def self.renew(int id, int duration=0)
